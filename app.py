@@ -43,7 +43,7 @@ CP_R82_VERIFIED_SNAPSHOT = {
 SOURCES = {
     "checkpoint": {"label": "Check Point (Gateway + Management)", "cpe": ["cpe:2.3:*:checkpoint:*"], "default_version": "R82", "default_hotfix": "Take 126"},
     "fortinet": {"label": "Fortinet FortiOS", "cpe": ["cpe:2.3:o:fortinet:fortios"], "default_version": "7.4.8", "default_hotfix": ""},
-    "paloalto": {"label": "Palo Alto PAN-OS", "cpe": ["cpe:2.3:o:paloaltonetworks:pan-os"], "default_version": "11.2.7-h20", "default_hotfix": ""},
+    "paloalto": {"label": "Palo Alto PAN-OS", "cpe": ["cpe:2.3:o:palo_alto_networks:pan-os"], "default_version": "11.2.7-h20", "default_hotfix": ""},
     "juniper": {"label": "Juniper Junos OS", "cpe": ["cpe:2.3:o:juniper:junos", "cpe:2.3:o:juniper:junos_os"], "default_version": "23.4R2-S3", "default_hotfix": ""},
 }
 # Vendor-owned domains for identifying reference links.
@@ -54,7 +54,7 @@ VENDOR_DOMAINS = {
     "juniper": ("juniper.net",),
 }
 
-app = FastAPI(title="VulnScope Live", version="2.0.0", description="Live vulnerability lookup with explicit source status")
+app = FastAPI(title="VulnScope Live", version="2.2.0", description="Live vulnerability lookup with explicit source status")
 app.mount("/static", StaticFiles(directory=str(ROOT / "static")), name="static")
 _CACHE: dict[str, tuple[float, object]] = {}
 _LOCKS: dict[str, asyncio.Lock] = {}
@@ -122,45 +122,54 @@ def compare(vendor: str, a: str, b: str) -> int:
 
 
 def version_in_cpe_match(m: dict, version: str, vendor: str):
-    """1 verified version predicate; 0 no; -1 indeterminate (not matched as negative)."""
-    cpe = m.get("criteria", "").lower().split(":")
+    """CPE evidence: 1=explicit version match, 0=excluded, -1=not enough precision.
+
+    An unversioned wildcard CPE is never a version match. Explicit CPE
+    updates and ranges must not silently override a mismatch.
+    """
+    cpe = str(m.get("criteria", "")).lower().split(":")
     if len(cpe) < 6:
         return -1
-    exact = cpe[5].replace(r"\.", ".")
-    # PAN-OS stores its hotfix in the CPE 'update' component, e.g. :11.2.7:h20.
-    update = cpe[6] if len(cpe) > 6 else "*"
-    test_version = version.lower().lstrip("v")
+    exact, update = cpe[5], cpe[6] if len(cpe) > 6 else "*"
+    target = version.strip().lower().removeprefix("v")
+    bounds = ("versionStartIncluding", "versionStartExcluding", "versionEndIncluding", "versionEndExcluding")
+    has_bounds = any(k in m for k in bounds)
+    # On PAN-OS, the CPE update identifies the hotfix. On Junos it can
+    # identify R/S service-release components. Do not ignore the update.
+    if vendor == "paloalto" and update.startswith("h") and update[1:].isdigit():
+        exact = exact + "-" + update if exact not in ("*", "-", "") else exact
+    elif vendor == "juniper" and re.fullmatch(r"r\d+(?:[_-]?s\d+)?", update):
+        exact = exact + update.replace("_", "-") if exact not in ("*", "-", "") else exact
+    elif vendor in ("paloalto", "juniper", "fortinet") and update not in ("*", "-", ""):
+        return -1
+    elif vendor == "checkpoint" and update not in ("*", "-", ""):
+        return -1
     if exact not in ("*", "-", ""):
-        expected = exact
-        if vendor == "paloalto" and update.startswith("h") and update[1:].isdigit():
-            expected += "-" + update
-            return 1 if expected == test_version else 0
-        if vendor == "paloalto" and update in ("*", "") and test_version.startswith(expected + "-h"):
-            return -1  # Update wildcard includes a hotfix but NVD does not specify which take.
-        if vendor == "paloalto" and update == "-":
-            return 1 if expected == test_version else 0
-        # Check Point encodes some Takes in CPE update field. A different precise Take is not a match.
-        if vendor == "checkpoint" and update.startswith("take_"):
-            return -1  # Take value is compared conservatively at the caller; no automatic fixed claim.
-        # Any named build/update without corresponding user-provided build lacks enough detail.
-        if vendor in ("fortinet", "juniper") and update not in ("*", "-", ""):
-            return -1 if expected == test_version else 0
-        if expected != test_version:
-            # No range: exact mismatch. With range: compare range instead.
-            if not any(k in m for k in ("versionStartIncluding", "versionStartExcluding", "versionEndIncluding", "versionEndExcluding")):
+        # PAN-OS update wildcard does NOT necessarily mean a concrete hotfix
+        # is affected; prefer vendor affected table for maintenance hotfixes.
+        if vendor == "paloalto" and update in ("*", "") and target.startswith(exact + "-h"):
+            return -1
+        if vendor == "juniper" and update in ("*", "") and target.startswith(exact + "r"):
+            return -1
+        if exact != target:
+            if not has_bounds:
                 return 0
-        else:
-            return 1
-    for key, expected in (("versionStartIncluding", -1), ("versionStartExcluding", 0)):
-        if key in m and compare(vendor, version, m[key]) <= expected:
+            # Exact CPE criterion is not interchangeable with a range for an
+            # entirely different version. Continue only if wildcarded.
             return 0
-    for key, expected in (("versionEndIncluding", 1), ("versionEndExcluding", 0)):
-        if key in m and compare(vendor, version, m[key]) >= expected:
-            return 0
-    if any(k in m for k in ("versionStartIncluding", "versionStartExcluding", "versionEndIncluding", "versionEndExcluding")):
-        # A ranged CPE matches, but complex vendor version semantics may differ.
+    for name in ("versionStartIncluding", "versionStartExcluding"):
+        if name in m:
+            comparison = compare(vendor, target, str(m[name]))
+            if comparison < 0 or (name == "versionStartExcluding" and comparison == 0):
+                return 0
+    for name in ("versionEndIncluding", "versionEndExcluding"):
+        if name in m:
+            comparison = compare(vendor, target, str(m[name]))
+            if comparison > 0 or (name == "versionEndExcluding" and comparison == 0):
+                return 0
+    if exact not in ("*", "-", "") or has_bounds:
         return 1
-    return -1  # wildcard CPE, no explicit version precision
+    return -1
 
 
 def matches_vendor_cpe(cpe: str, vendor: str) -> bool:
@@ -332,6 +341,86 @@ def checkpoint_cna_match(cve, version, hotfix):
     return outcome, evidence[:12], scope
 
 
+def affected_product_matches(item, vendor, version):
+    """Only accept the requested OS family, not unrelated vendor products."""
+    brand = re.sub(r"[^a-z0-9]", "", str(item.get("vendor", "")).lower())
+    product = re.sub(r"[^a-z0-9]", "", str(item.get("product", "")).lower())
+    if vendor == "fortinet":
+        return brand == "fortinet" and product in ("fortios", "fortigatefirmware")
+    if vendor == "juniper":
+        is_evolved = "evo" in version.lower()
+        products = ("junososevolved", "junosevolved") if is_evolved else ("junosos", "junos")
+        return brand in ("juniper", "junipernetworks") and product in products
+    return False
+
+
+def cna_version_rule(rule, version, vendor):
+    """Interpret a single structured CNA version rule without text guesswork.
+
+    Returns (matches, specificity), with unrecognized formats considered
+    unresolved rather than explicitly unaffected.
+    """
+    if not isinstance(rule, dict):
+        return False, 0
+    low = str(rule.get("version", "")).strip()
+    target = str(version).strip()
+    if not low:
+        return False, 0
+    if low.lower() in ("all", "*"):
+        return True, 0
+    lt, le = rule.get("lessThan"), rule.get("lessThanOrEqual")
+    if lt or le:
+        if low not in ("0", "0.0", "-") and compare(vendor, target, low) < 0:
+            return False, 0
+        bound = str(lt or le)
+        diff = compare(vendor, target, bound)
+        return (diff < 0 if lt else diff <= 0), 2
+    if compare(vendor, target, low) == 0:
+        return True, 3
+    # A CNA version such as '7.4' means an entire named maintenance branch,
+    # but NOT 7.40 or a different Junos train. More precise bounds win.
+    if re.fullmatch(r"\d+\.\d+", low):
+        if target.lower().startswith(low.lower() + ".") or (vendor == "juniper" and target.lower().startswith(low.lower() + "r")):
+            return True, 1
+    return False, 0
+
+
+def vendor_cna_match(cve, vendor, version):
+    """Use CVE Program CNA affected data exposed through NVD for Junos/FortiOS.
+
+    2=affected, 0=vendor says unaffected, 1=unknown / not decisive.
+    None=there is no relevant vendor affected table (try NVD CPE).
+    """
+    if vendor not in ("fortinet", "juniper"):
+        return None
+    products = [p for p in vendor_affected_blocks(cve) if affected_product_matches(p, vendor, version)]
+    if not products:
+        return None
+    candidates = []
+    evidence = []
+    for product in products:
+        product_name = str(product.get("product", ""))
+        for item in product.get("versions") or []:
+            matched, specificity = cna_version_rule(item, version, vendor)
+            if not matched:
+                continue
+            status = str(item.get("status", "unknown")).lower()
+            if status not in ("affected", "unaffected"):
+                continue
+            candidates.append((specificity, status, item))
+        evidence.append(product_name)
+    if candidates:
+        # Most specific rule wins. On equally specific conflicting CNA rules,
+        # treat 'unaffected' as precedence instead of inventing exposure.
+        candidates.sort(key=lambda x: (x[0], x[1] == "unaffected"), reverse=True)
+        specificity, status, rule = candidates[0]
+        rule_string = " ".join(str(rule.get(k, "")) for k in ("version", "lessThan", "lessThanOrEqual") if rule.get(k))
+        return (2 if status == "affected" else 0), [f"{evidence[0]}: {rule_string} [{status}]"], ""
+    if products and all(str(p.get("defaultStatus", "unknown")).lower() == "unaffected" for p in products):
+        return 0, [f"{evidence[0]}: no affected rule matches {version}; CNA default is unaffected"], ""
+    return 1, [f"{evidence[0]}: vendor version table does not establish {version}"], ""
+
+
 def cpe_cp_relevance(m, version, hotfix, cve_description=""):
     """Discard legacy/unversioned Check Point records; never 'match' by vendor name."""
     parts = str(m.get("criteria", "")).lower().split(":")
@@ -417,13 +506,20 @@ def normalize_nvd(item: dict, vendor: str, version: str, hotfix: str):
     cve = item.get("cve", item)
     if cve.get("vulnStatus", "").lower() == "rejected":
         return None
-    structured = checkpoint_cna_match(cve, version, hotfix) if vendor == "checkpoint" else None
+    structured = (checkpoint_cna_match(cve, version, hotfix) if vendor == "checkpoint" else
+                  vendor_cna_match(cve, vendor, version) if vendor in ("fortinet", "juniper") else None)
     if structured is not None:
         # A vendor-supplied affected table is more authoritative than a broad NVD CPE.
         match, predicates, scope = structured
         predicates = [{"CNA affected": x} for x in predicates]
-        if not match:
+        if match == 0:
             return None
+        # Unknown CNA evidence can still be supplemented by a precise NVD
+        # CPE, but it must never become a version match merely by existence.
+        if match == 1:
+            cpe_status, cpe_evidence = score_nvd_configuration(cve, vendor, version, hotfix)
+            if cpe_status == 2:
+                match, predicates = cpe_status, cpe_evidence
     else:
         match, predicates = score_nvd_configuration(cve, vendor, version, hotfix)
         if not match:
@@ -442,8 +538,10 @@ def normalize_nvd(item: dict, vendor: str, version: str, hotfix: str):
             "Release matches the advisory, but this Jumbo Take is above the vendor's stated affected range. Not independently verified patched; check official release notes."
             if structured is not None and match == 3 else
             "Check Point CNA explicitly lists this release and Jumbo Take in its affected-version table; device configuration not checked"
+            if structured is not None and vendor == "checkpoint" and match == 2 else
+            "Vendor CNA affected-version table matches this OS version; model/configuration conditions not assessed"
             if structured is not None and match == 2 else
-            "Check Point CNA lists this release, but Hotfix applicability requires review"
+            "Vendor CNA lists this product, but version applicability needs review"
             if structured is not None else
             "NVD vulnerable CPE version/range matches; device conditions are not checked"
             if match == 2 else
@@ -463,7 +561,8 @@ async def fetch_nvd(client, vendor, version, hotfix):
     # Check Point CNA-published CVEs may have NO NVD CPE because they are
     # Awaiting Analysis. The sourceIdentifier query retrieves their CNA affected
     # tables, including detailed JHF Take thresholds.
-    searches = ([{"sourceIdentifier": "cve@checkpoint.com"}] if vendor == "checkpoint" else []) + [
+    source_ids = {"checkpoint": "cve@checkpoint.com", "fortinet": "psirt@fortinet.com", "juniper": "sirt@juniper.net"}
+    searches = ([{"sourceIdentifier": source_ids[vendor]}] if vendor in source_ids else []) + [
         {"virtualMatchString": cpe} for cpe in sources
     ]
     for idx, query in enumerate(searches):
@@ -524,34 +623,75 @@ def flatten_pan(raw):
 
 
 def pan_cve5_status(cna, version):
-    """Use vendor CNA version status; unknown formats stay review, not falsely safe."""
+    """Match all PAN-OS CVE 5 affected blocks; never exit on first block.
+
+    Prefer precise PAN-OS version predicates to generic defaultStatus. When
+    no rule fits, a CNA 'unaffected' default is respected.
+    """
+    candidates = []
+    defaults = []
     for block in cna.get("affected", []):
         if str(block.get("product", "")).lower() not in ("pan-os", "pan_os"):
             continue
-        matches = []
+        defaults.append(str(block.get("defaultStatus", "unknown")).lower())
         for v in block.get("versions", []):
-            base = str(v.get("version", ""))
-            status = str(v.get("status", "")).lower()
+            base = str(v.get("version", "")).strip()
+            status = str(v.get("status", "unknown")).lower()
             if base.lower() == "all":
-                matches.append((status, 0))
+                candidates.append(((0, ()), status))
                 continue
-            if not re.match(r"^\d+\.\d+\.\d+", base):
+            if not re.fullmatch(r"\d+\.\d+\.\d+(?:-h\d+)?", base, re.I):
                 continue
             end = v.get("lessThan") or v.get("lessThanOrEqual")
-            if end:
-                good = compare_panos(version, base) >= 0 and (
-                    compare_panos(version, end) < 0 if v.get("lessThan") else compare_panos(version, end) <= 0
-                )
-            else:
-                good = compare_panos(version, base) == 0
-            if good:
-                matches.append((status, 2))
-        if matches:
-            # Most-specific match wins.
-            matches.sort(key=lambda x: x[1], reverse=True)
-            return matches[0][0]
-        return str(block.get("defaultStatus", "unknown")).lower()
+            if compare_panos(version, base) < 0:
+                continue
+            if end and (compare_panos(version, end) >= 0 if v.get("lessThan") else compare_panos(version, end) > 0):
+                continue
+            for change in sorted(v.get("changes") or [], key=lambda x: tokenize_version(str(x.get("at", "")))):
+                at = str(change.get("at", ""))
+                if at and compare_panos(version, at) >= 0:
+                    status = str(change.get("status", status)).lower()
+            candidates.append(((2, tokenize_version(base)), status))
+    if candidates:
+        candidates.sort(key=lambda x: (x[0], x[1] == "unaffected"), reverse=True)
+        return candidates[0][1]
+    if defaults and all(x == "unaffected" for x in defaults):
+        return "unaffected"
     return "unknown"
+
+
+def pan_summary_status(rec, version):
+    """Read PAN's *real* condensed JSON shape: ID, baseScore, version[], affected[].
+
+    Require a threshold for the SAME maintenance train (e.g. 11.2.7) before
+    claiming a hotfix is version matched; other train thresholds are not proof.
+    """
+    version_labels = rec.get("version") or []
+    affected = rec.get("affected") or []
+    if not isinstance(version_labels, list) or not isinstance(affected, list):
+        return "unknown", ""
+    prefix = ".".join(version.lower().split("-h")[0].split(".")[:2])
+    base = version.lower().split("-h")[0]
+    for label, affected_text in zip(version_labels, affected):
+        if str(label).strip().lower() != f"pan-os {prefix}":
+            continue
+        description = str(affected_text)
+        thresholds = re.findall(r"(?<![\w])(?:<=|<|>=|>)\s*(\d+\.\d+\.\d+(?:-h\d+)?)", description, re.I)
+        # An affected column usually has '<' constraints. Ignore 'None'.
+        same_train = [x for x in thresholds if x.lower().split("-h")[0] == base]
+        if not same_train:
+            return "unknown", description
+        for raw in re.split(r"[,;\n]+", description):
+            match = re.search(r"(<=|<|>=|>)\s*(\d+\.\d+\.\d+(?:-h\d+)?)", raw.strip(), re.I)
+            if not match or match.group(2).lower().split("-h")[0] != base:
+                continue
+            sign, bound = match.groups()
+            comparison = compare_panos(version, bound)
+            correct = (comparison < 0 if sign == "<" else comparison <= 0 if sign == "<=" else
+                       comparison > 0 if sign == ">" else comparison >= 0)
+            return ("affected" if correct else "unaffected"), raw.strip()
+        return "unknown", description
+    return "unknown", ""
 
 
 def normalize_pan(rec, version):
@@ -582,50 +722,70 @@ def normalize_pan(rec, version):
                 "fixed": best_text(cna.get("solutions")) or "Refer to vendor advisory",
                 "workaround": best_text(cna.get("workarounds")) or "Refer to vendor advisory",
                 "vendor_direct": True}
-    cveid = str(rec.get("cve_id") or rec.get("cve") or rec.get("id") or "")
+    # Condensed PSIRT response uses uppercase ID and baseScore (not cve_id/cvss_score).
+    cveid = str(rec.get("ID") or rec.get("cve_id") or rec.get("cve") or rec.get("id") or "")
     if not re.fullmatch(r"CVE-\d{4}-\d{4,}", cveid, flags=re.I):
-        return None  # Incomplete summary; do not fabricate an ID.
-    raw_score = rec.get("cvss_score", rec.get("cvss"))
+        return None
+    raw_score = rec.get("baseScore", rec.get("cvss_score", rec.get("cvss")))
     try:
         score = float(raw_score)
     except (TypeError, ValueError):
         score = None
+    status, evidence = pan_summary_status(rec, version)
+    if status == "unaffected":
+        return None
+    text = best_text(rec.get("problem")) or str(rec.get("description") or "See official advisory")
+    solution = best_text(rec.get("solution")) or str(rec.get("fixed_versions") or "Refer to advisory")
+    workaround = best_text(rec.get("work_around")) or str(rec.get("workarounds") or "Refer to advisory")
     return {"id": cveid, "title": str(rec.get("title") or cveid),
-            "description": str(rec.get("description") or "See official advisory"),
-            "severity": severity_of(score, str(rec.get("severity", ""))), "cvss": score,
-            "published": str(rec.get("published_date") or rec.get("datePublic") or ""),
-            "updated": str(rec.get("last_modified_date") or ""), "source": "Palo Alto PSIRT",
+            "description": text, "severity": severity_of(score, str(rec.get("baseSeverity") or rec.get("severity", ""))), "cvss": score,
+            "published": str(rec.get("date") or rec.get("published_date") or rec.get("datePublic") or ""),
+            "updated": str(rec.get("updated") or rec.get("last_modified_date") or ""), "source": "Palo Alto PSIRT",
             "source_url": f"https://security.paloaltonetworks.com/{cveid}", "nvd_url": f"https://nvd.nist.gov/vuln/detail/{cveid}",
-            "status": "review", "status_reason": "Vendor summary matches query; advisory version table not yet parsed",
-            "scope": "", "affected": str(rec.get("affected_products") or "Refer to advisory")[:1200],
-            "fixed": str(rec.get("fixed_versions") or "Refer to advisory")[:1200],
-            "workaround": str(rec.get("workarounds") or "Refer to advisory")[:1200],
-            "vendor_direct": True}
+            "status": "version_match" if status == "affected" else "review",
+            "status_reason": "PAN PSIRT affected threshold: " + evidence if status == "affected" else "Vendor summary does not establish exact maintenance/hotfix applicability",
+            "scope": "", "affected": evidence[:1200] if evidence else "Version applicability not resolved",
+            "fixed": solution[:1200], "workaround": workaround[:1200], "vendor_direct": True}
 
 
 async def fetch_palo(client, version):
     try:
-        # Official PSIRT supports product/version filtering; version includes PAN-OS prefix.
         raw = await request_json(client, PAN_JSON, {"product": "PAN-OS", "version": "PAN-OS " + version})
         items = flatten_pan(raw)
-        rows = [x for x in (normalize_pan(rec, version) for rec in items if isinstance(rec, dict)) if x]
-        # The list endpoint can return condensed records. Fetch full CVE 5.0 details for top matches.
-        async def enrich(row):
-            try:
-                obj = await request_json(client, PAN_JSON + "/" + row["id"])
-                detail = normalize_pan(obj, version)
-                if detail:
-                    return detail
-            except Exception:
-                pass
-            return row
+        candidate_rows = [x for x in (normalize_pan(rec, version) for rec in items if isinstance(rec, dict)) if x]
+        # Fetch full vendor advisories; the condensed response has less precise
+        # affected-version information. Preserve a precisely matched summary if
+        # the detail endpoint times out, and expose incomplete enrichment.
         sem = asyncio.Semaphore(4)
-        async def bounded(row):
+        failures = 0
+        async def enrich(row):
+            nonlocal failures
             async with sem:
-                return await enrich(row)
-        rows = await asyncio.gather(*[bounded(r) for r in rows[:65]]) + rows[65:]
-        return {"rows": rows, "ok": True, "partial": len(rows) > 65,
-                "notes": [f"Official PAN-OS version-filtered JSON returned {len(items)} records. Revalidated up to 65 full advisories."]}
+                try:
+                    obj = await request_json(client, PAN_JSON + "/" + row["id"])
+                    detail = normalize_pan(obj, version)
+                    if detail is None:
+                        # A full CVE JSON may contain a differently structured
+                        # version table. An explicit "unaffected" result takes
+                        # precedence; an unparseable record does not erase a
+                        # independently verified maintenance-train threshold.
+                        if isinstance(obj, dict) and "cveMetadata" in obj:
+                            cna = (obj.get("containers") or {}).get("cna") or {}
+                            if pan_cve5_status(cna, version) == "unknown":
+                                return row
+                        return None
+                    if row["status"] == "version_match" and detail["status"] == "review":
+                        detail["status"] = "version_match"
+                        detail["status_reason"] = row["status_reason"]
+                        detail["affected"] = row["affected"]
+                    return detail
+                except Exception:
+                    failures += 1
+                    return row
+        enriched = await asyncio.gather(*(enrich(r) for r in candidate_rows[:65]))
+        rows = [x for x in enriched if x] + candidate_rows[65:]
+        return {"rows": rows, "ok": True, "partial": failures > 0 or len(candidate_rows) > 65,
+                "notes": [f"Official PAN PSIRT JSON: {len(items)} condensed advisories, {len(candidate_rows)} parsed, {len(rows)} retained; {failures} full-advisory requests failed; first 65 rechecked."]}
     except Exception as exc:
         return {"rows": [], "ok": False, "partial": True, "notes": ["Palo Alto PSIRT unavailable: " + clean_error(exc)]}
 
@@ -824,8 +984,37 @@ async def search(
     if not re.fullmatch(r"[a-zA-Z0-9._\- ]+", version) or not re.fullmatch(r"[a-zA-Z0-9._\- ]*", hotfix):
         raise HTTPException(400, detail="Invalid version or hotfix format")
     version, hotfix = version.strip(), hotfix.strip()
-    if vendor == "paloalto" and hotfix and not re.search(r"-h\d+$", version, re.I):
-        version += "-" + hotfix.lower().lstrip("-")
+    valid_versions = {
+        "checkpoint": r"R\d+(?:\.\d+)?",
+        "fortinet": r"\d+\.\d+\.\d+",
+        "paloalto": r"\d+\.\d+\.\d+(?:-h\d+)?",
+        "juniper": r"\d+\.\d+[Rr]\d+(?:-[Ss]\d+(?:\.\d+)?)?(?:-[Ee][Vv][Oo])?",
+    }
+    if not re.fullmatch(valid_versions[vendor], version, re.I):
+        raise HTTPException(400, detail=f"Invalid {vendor} OS version format")
+    if vendor == "checkpoint":
+        if hotfix and cp_take(hotfix) is None:
+            raise HTTPException(400, detail="Check Point Hotfix must look like Take 126")
+    elif vendor == "paloalto" and hotfix:
+        value = hotfix.lower().lstrip("-")
+        if not re.fullmatch(r"h\d+", value):
+            raise HTTPException(400, detail="PAN-OS hotfix must look like h21")
+        installed = re.search(r"-h(\d+)$", version, re.I)
+        if installed and int(installed.group(1)) != int(value[1:]):
+            raise HTTPException(400, detail="PAN-OS version and Hotfix field disagree")
+        if not installed:
+            version += "-" + value
+    elif vendor == "juniper" and hotfix:
+        value = hotfix.upper().lstrip("-")
+        if not re.fullmatch(r"S\d+(?:\.\d+)?", value):
+            raise HTTPException(400, detail="Junos service release must look like S3")
+        if re.search(r"-S\d+", version, re.I):
+            if not re.search(r"-"+re.escape(value)+r"(?:-EVO)?$", version, re.I):
+                raise HTTPException(400, detail="Junos version and service release disagree")
+        else:
+            version = re.sub(r"(-EVO)?$", lambda m: "-"+value+(m.group(1) or ""), version, flags=re.I)
+    elif vendor == "fortinet" and hotfix:
+        raise HTTPException(400, detail="FortiOS build/hotfix is not supported separately. Use the full FortiOS version; don't infer build patch status.")
     key = f"search:{vendor}:{version}:{hotfix}"
     async def run():
         async with httpx.AsyncClient(timeout=httpx.Timeout(22, connect=8),
