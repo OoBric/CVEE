@@ -1,4 +1,4 @@
-"""VulnScope Live v1.5: version-matched CVEs with persistent Seen/Updated tracking.
+"""VulnScope v2.4: version-matched CVEs with persistent Seen/Updated tracking.
 Run: uvicorn app:app --host 127.0.0.1 --port 8000
 """
 import asyncio
@@ -54,7 +54,7 @@ VENDOR_DOMAINS = {
     "juniper": ("juniper.net",),
 }
 
-app = FastAPI(title="VulnScope Live", version="2.3.0", description="Live vulnerability lookup with explicit source status")
+app = FastAPI(title="VulnScope Live", version="2.4.0", description="Live vulnerability lookup with explicit source status")
 app.mount("/static", StaticFiles(directory=str(ROOT / "static")), name="static")
 _CACHE: dict[str, tuple[float, object]] = {}
 _LOCKS: dict[str, asyncio.Lock] = {}
@@ -421,6 +421,59 @@ def vendor_cna_match(cve, vendor, version):
     return 1, [f"{evidence[0]}: vendor version table does not establish {version}"], ""
 
 
+def pan_nvd_cna_match(cve, version):
+    """CVE Program affected entries of the Palo Alto CNA published in NVD.
+
+    A broad 11.2.0--11.2.16 rule is NOT enough to establish which
+    11.2.7 hotfix is vulnerable. Require a maintenance-train-specific
+    threshold, exact build, or change marker. Unknown remains review-only.
+    """
+    blocks = [block for block in vendor_affected_blocks(cve)
+              if str(block.get("product", "")).lower().replace("_", "-") == "pan-os"
+              and "palo alto" in str(block.get("vendor", "palo alto")).lower()]
+    if not blocks:
+        return None
+    base = version.lower().split("-h")[0]
+    examined = []
+    evidence = []
+    saw_same_train = False
+    for block in blocks:
+        for rule in block.get("versions", []):
+            if not isinstance(rule, dict):
+                continue
+            low = str(rule.get("version") or "").strip()
+            end = str(rule.get("lessThan") or rule.get("lessThanOrEqual") or "").strip()
+            changes = rule.get("changes") or []
+            same_train = lambda x: x.lower().split("-h")[0] == base
+            if not (same_train(low) or same_train(end) or any(same_train(str(c.get("at", ""))) for c in changes)):
+                continue
+            saw_same_train = True
+            # The same-train change marker overrides a cross-train broad range.
+            train_changes = [c for c in changes if same_train(str(c.get("at", "")))]
+            if train_changes:
+                train_changes.sort(key=lambda c: tokenize_version(str(c.get("at"))))
+                state = str(rule.get("status", "unknown")).lower()
+                for c in train_changes:
+                    at = str(c.get("at"))
+                    if compare_panos(version, at) >= 0:
+                        state = str(c.get("status", state)).lower()
+                if state in ("affected", "unaffected"):
+                    examined.append((3, state))
+                    evidence.append(f"PAN-OS {base} CNA hotfix changes: {train_changes}")
+                continue
+            candidate = {"affected": [{"product": "PAN-OS", "defaultStatus": "unknown", "versions": [rule]}]}
+            status = pan_cve5_status(candidate, version)
+            if status in ("affected", "unaffected"):
+                examined.append((2, status))
+                evidence.append(f"PAN-OS CNA explicit maintenance rule: {rule}")
+    if examined:
+        examined.sort(key=lambda x: (x[0], x[1] == 'unaffected'), reverse=True)
+        return (2 if examined[0][1] == 'affected' else 0, evidence[:3], '')
+    if saw_same_train and all(str(b.get('defaultStatus', 'unknown')).lower() == 'unaffected' for b in blocks):
+        return (0, [f"Palo Alto CNA same-train affected range excludes {version}; default unaffected"], '')
+    return (1, [f"Palo Alto CNA has PAN-OS rules but no conclusive {base} hotfix evidence"], '')
+
+
 def cpe_cp_relevance(m, version, hotfix, cve_description=""):
     """Discard legacy/unversioned Check Point records; never 'match' by vendor name."""
     parts = str(m.get("criteria", "")).lower().split(":")
@@ -507,7 +560,8 @@ def normalize_nvd(item: dict, vendor: str, version: str, hotfix: str):
     if cve.get("vulnStatus", "").lower() == "rejected":
         return None
     structured = (checkpoint_cna_match(cve, version, hotfix) if vendor == "checkpoint" else
-                  vendor_cna_match(cve, vendor, version) if vendor in ("fortinet", "juniper") else None)
+                  vendor_cna_match(cve, vendor, version) if vendor in ("fortinet", "juniper") else
+                  pan_nvd_cna_match(cve, version) if vendor == "paloalto" else None)
     if structured is not None:
         # A vendor-supplied affected table is more authoritative than a broad NVD CPE.
         match, predicates, scope = structured
@@ -561,7 +615,7 @@ async def fetch_nvd(client, vendor, version, hotfix):
     # Check Point CNA-published CVEs may have NO NVD CPE because they are
     # Awaiting Analysis. The sourceIdentifier query retrieves their CNA affected
     # tables, including detailed JHF Take thresholds.
-    source_ids = {"checkpoint": "cve@checkpoint.com", "fortinet": "psirt@fortinet.com", "juniper": "sirt@juniper.net"}
+    source_ids = {"checkpoint": "cve@checkpoint.com", "fortinet": "psirt@fortinet.com", "juniper": "sirt@juniper.net", "paloalto": "psirt@paloaltonetworks.com"}
     searches = ([{"sourceIdentifier": source_ids[vendor]}] if vendor in source_ids else []) + [
         {"virtualMatchString": cpe} for cpe in sources
     ]
@@ -757,7 +811,7 @@ def normalize_pan(rec, version):
 
 
 async def fetch_palo(client, version):
-    """Cross-check PAN's exact-version endpoint against its complete product index.
+    """Cross-check PAN exact-version, product-wide and unfiltered indexes.
 
     The version-filtered PSIRT index is useful, but an absent record is NOT
     negative version evidence. The product-wide index can contain advisories
@@ -767,10 +821,17 @@ async def fetch_palo(client, version):
     requests = (
         ("exact-version", {"product": "PAN-OS", "version": "PAN-OS " + version}),
         ("product-wide", {"product": "PAN-OS", "sort": "-updated"}),
+        ("unfiltered-index", None),
     )
     async def query(name, params):
         try:
-            result = await request_json(client, PAN_JSON, params)
+            if params is None:
+                # The documented GET /json index, without pagination or
+                # version filtering. Cache it because it can be large.
+                result = await cached("pan:full_vendor_index", 3600,
+                                      lambda: request_json(client, PAN_JSON))
+            else:
+                result = await request_json(client, PAN_JSON, params)
             return name, flatten_pan(result), None
         except Exception as exc:
             return name, [], clean_error(exc)
@@ -785,6 +846,9 @@ async def fetch_palo(client, version):
             notes.append(f"Palo Alto PSIRT {name} query failed: {error}")
         else:
             notes.append(f"Palo Alto PSIRT {name} index returned {len(items)} advisories")
+            if not items:
+                failures += 1
+                notes.append(f"Palo Alto PSIRT {name} index empty; cannot assume completeness")
         for rec in items:
             if not isinstance(rec, dict):
                 continue

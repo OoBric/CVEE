@@ -1,6 +1,12 @@
-# VulnScope Cinematic v2.0
+# VulnScope Cinematic v2.3
+
+> See **V2_3_FIX_NOTES.md** for critical fixes to PAN-OS version comparison and advisory coverage. Tested with 55 simulated tests; live completeness not guaranteed.
+
+# VulnScope Cinematic v2.2 — All Vendor Matching Update
 
 **Four vendors. One command center.** A redesigned version-first firewall CVE lookup built on the existing tested VulnScope backend.
+
+**Important:** v2.2 revises Check Point, Fortinet, Palo Alto and Juniper matching logic. Read `ALL_VENDOR_FIX_NOTES.md` for source coverage, vendor-specific behavior and limitations. This does not guarantee detection of every CVE.
 
 ## What changed
 
@@ -28,10 +34,11 @@ pip install -r requirements.txt -r requirements-dev.txt
 pytest -q
 ```
 
-Tested: 33 Python regression tests passing; browser UI smoke tests with mock API responses exercised search, CVE detail, severity counters, Seen tab and Mark Seen. **No external live NVD/vendor API end-to-end validation in this packaging environment**. Treat upstream errors as incomplete results, not no vulnerabilities. This is *not* a certified patch/exposure assessment.
+Tested: 49 Python regression tests passing (including mock CNA/NVD schemas across all four vendors); browser UI smoke tests with mock API responses exercised search, CVE detail, severity counters, Seen tab and Mark Seen. **No external live NVD/vendor API end-to-end validation in this packaging environment**. Treat upstream errors as incomplete results, not no vulnerabilities. This is *not* a certified patch/exposure assessment.
 
 ## Other docs
 
 - `SEEN_TRACKING_GUIDE.md` — tracker persistence, read states and backup.
 - `MICROSOFT_365_SETUP.md` — optional Microsoft Lists sync.
+- `ALL_VENDOR_FIX_NOTES.md` — four-vendor matching changes and limits.
 - `m365.local.env.example` — optional M365 config template.
