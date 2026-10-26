@@ -1,0 +1,8 @@
+m365.local.env
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+watchlist.json
+# Local persistent Seen/Updated tracker (back up before reinstalling)
+data/

@@ -1,0 +1,4 @@
+[
+  {"vendor": "checkpoint", "version": "R82", "hotfix": "Take 127", "severities": ["Critical", "High", "Medium"]},
+  {"vendor": "paloalto", "version": "11.2.7-h20", "hotfix": "", "severities": ["Critical", "High", "Medium"]}
+]
