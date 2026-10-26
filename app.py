@@ -54,7 +54,7 @@ VENDOR_DOMAINS = {
     "juniper": ("juniper.net",),
 }
 
-app = FastAPI(title="VulnScope Live", version="2.2.0", description="Live vulnerability lookup with explicit source status")
+app = FastAPI(title="VulnScope Live", version="2.3.0", description="Live vulnerability lookup with explicit source status")
 app.mount("/static", StaticFiles(directory=str(ROOT / "static")), name="static")
 _CACHE: dict[str, tuple[float, object]] = {}
 _LOCKS: dict[str, asyncio.Lock] = {}
@@ -611,7 +611,7 @@ def flatten_pan(raw):
         return raw
     if not isinstance(raw, dict):
         return []
-    if raw.get("cveMetadata") or raw.get("cve_id") or raw.get("cve"):
+    if raw.get("cveMetadata") or raw.get("ID") or raw.get("cve_id") or raw.get("cve"):
         return [raw]
     for field in ("items", "advisories", "results", "data", "vulnerabilities"):
         data = raw.get(field)
@@ -643,11 +643,19 @@ def pan_cve5_status(cna, version):
             if not re.fullmatch(r"\d+\.\d+\.\d+(?:-h\d+)?", base, re.I):
                 continue
             end = v.get("lessThan") or v.get("lessThanOrEqual")
-            if compare_panos(version, base) < 0:
-                continue
-            if end and (compare_panos(version, end) >= 0 if v.get("lessThan") else compare_panos(version, end) > 0):
-                continue
-            for change in sorted(v.get("changes") or [], key=lambda x: tokenize_version(str(x.get("at", "")))):
+            changes = v.get("changes") or []
+            # CVE 5.0 'version: 11.2.2' without a range or changes means
+            # EXACTLY 11.2.2. Previously treating it as >= 11.2.2 falsely
+            # marked 11.2.7-h20 as affected by CVE-2024-8686.
+            if not end and not changes:
+                if compare_panos(version, base) != 0:
+                    continue
+            else:
+                if compare_panos(version, base) < 0:
+                    continue
+                if end and (compare_panos(version, end) >= 0 if v.get("lessThan") else compare_panos(version, end) > 0):
+                    continue
+            for change in sorted(changes, key=lambda x: tokenize_version(str(x.get("at", "")))):
                 at = str(change.get("at", ""))
                 if at and compare_panos(version, at) >= 0:
                     status = str(change.get("status", status)).lower()
@@ -749,45 +757,106 @@ def normalize_pan(rec, version):
 
 
 async def fetch_palo(client, version):
-    try:
-        raw = await request_json(client, PAN_JSON, {"product": "PAN-OS", "version": "PAN-OS " + version})
-        items = flatten_pan(raw)
-        candidate_rows = [x for x in (normalize_pan(rec, version) for rec in items if isinstance(rec, dict)) if x]
-        # Fetch full vendor advisories; the condensed response has less precise
-        # affected-version information. Preserve a precisely matched summary if
-        # the detail endpoint times out, and expose incomplete enrichment.
-        sem = asyncio.Semaphore(4)
-        failures = 0
-        async def enrich(row):
-            nonlocal failures
-            async with sem:
-                try:
-                    obj = await request_json(client, PAN_JSON + "/" + row["id"])
-                    detail = normalize_pan(obj, version)
-                    if detail is None:
-                        # A full CVE JSON may contain a differently structured
-                        # version table. An explicit "unaffected" result takes
-                        # precedence; an unparseable record does not erase a
-                        # independently verified maintenance-train threshold.
-                        if isinstance(obj, dict) and "cveMetadata" in obj:
-                            cna = (obj.get("containers") or {}).get("cna") or {}
-                            if pan_cve5_status(cna, version) == "unknown":
-                                return row
-                        return None
-                    if row["status"] == "version_match" and detail["status"] == "review":
-                        detail["status"] = "version_match"
-                        detail["status_reason"] = row["status_reason"]
-                        detail["affected"] = row["affected"]
-                    return detail
-                except Exception:
-                    failures += 1
-                    return row
-        enriched = await asyncio.gather(*(enrich(r) for r in candidate_rows[:65]))
-        rows = [x for x in enriched if x] + candidate_rows[65:]
-        return {"rows": rows, "ok": True, "partial": failures > 0 or len(candidate_rows) > 65,
-                "notes": [f"Official PAN PSIRT JSON: {len(items)} condensed advisories, {len(candidate_rows)} parsed, {len(rows)} retained; {failures} full-advisory requests failed; first 65 rechecked."]}
-    except Exception as exc:
-        return {"rows": [], "ok": False, "partial": True, "notes": ["Palo Alto PSIRT unavailable: " + clean_error(exc)]}
+    """Cross-check PAN's exact-version endpoint against its complete product index.
+
+    The version-filtered PSIRT index is useful, but an absent record is NOT
+    negative version evidence. The product-wide index can contain advisories
+    missing from the exact-version query. We only mark a row as version_match
+    when its own published affected-version rules support that result.
+    """
+    requests = (
+        ("exact-version", {"product": "PAN-OS", "version": "PAN-OS " + version}),
+        ("product-wide", {"product": "PAN-OS", "sort": "-updated"}),
+    )
+    async def query(name, params):
+        try:
+            result = await request_json(client, PAN_JSON, params)
+            return name, flatten_pan(result), None
+        except Exception as exc:
+            return name, [], clean_error(exc)
+
+    index_responses = await asyncio.gather(*(query(name, params) for name, params in requests))
+    notes = []
+    failures = 0
+    by_id = {}
+    for name, items, error in index_responses:
+        if error:
+            failures += 1
+            notes.append(f"Palo Alto PSIRT {name} query failed: {error}")
+        else:
+            notes.append(f"Palo Alto PSIRT {name} index returned {len(items)} advisories")
+        for rec in items:
+            if not isinstance(rec, dict):
+                continue
+            cve_id = str(rec.get('ID') or rec.get('cve_id') or rec.get('cve')
+                         or rec.get('id') or (rec.get('cveMetadata') or {}).get('cveId') or '').upper()
+            if not re.fullmatch(r'CVE-\d{4}-\d{4,}', cve_id):
+                continue
+            # Keep the first occurrence (the more targeted index), unless the
+            # broader index has stronger matching evidence for this version.
+            normalized = normalize_pan(rec, version)
+            old = by_id.get(cve_id)
+            if old is None or (normalized and normalized.get('status') == 'version_match'
+                               and old.get('status') != 'version_match'):
+                if normalized:
+                    by_id[cve_id] = normalized
+
+    if failures == len(index_responses):
+        return {'rows': [], 'ok': False, 'partial': True, 'notes': notes}
+
+    candidates = list(by_id.values())
+    # Exact maintenance thresholds are already good evidence. Use full JSON to
+    # resolve uncertain summaries as well. Prioritize newest unknown records,
+    # rather than using whatever order an upstream API happens to return.
+    matches = [r for r in candidates if r['status'] == 'version_match']
+    unresolved = [r for r in candidates if r['status'] != 'version_match']
+    def datekey(r):
+        return str(r.get('updated') or r.get('published') or '')
+    matches.sort(key=datekey, reverse=True)
+    unresolved.sort(key=datekey, reverse=True)
+    max_full = 48  # Limit expensive calls; report unresolved backlog as partial.
+    detail_targets = matches[:max_full] + unresolved[:max(0, max_full-len(matches))]
+    detail_ids = {r['id'] for r in detail_targets}
+    sem = asyncio.Semaphore(4)
+    detail_failures = 0
+
+    async def enrich(row):
+        nonlocal detail_failures
+        async with sem:
+            try:
+                obj = await asyncio.wait_for(request_json(client, PAN_JSON + '/' + row['id']), timeout=7.0)
+                detail = normalize_pan(obj, version)
+                if detail is None:
+                    # A structured 'unaffected' conclusion supersedes the
+                    # summary. A record with no usable structured version
+                    # evidence does not supersede an exact summary match.
+                    if isinstance(obj, dict) and 'cveMetadata' in obj:
+                        cna = (obj.get('containers') or {}).get('cna') or {}
+                        if pan_cve5_status(cna, version) == 'unknown':
+                            return row
+                    return None
+                if row['status'] == 'version_match' and detail['status'] == 'review':
+                    detail['status'] = 'version_match'
+                    detail['status_reason'] = row['status_reason']
+                    detail['affected'] = row['affected']
+                return detail
+            except Exception:
+                detail_failures += 1
+                return row
+
+    enriched = await asyncio.gather(*(enrich(r) for r in detail_targets))
+    processed = [r for r in enriched if r]
+    # Always preserve un-enriched summary matches. Unknown rows need full
+    # detail before being promoted to version-matched; keep them as review.
+    processed.extend(r for r in matches if r['id'] not in detail_ids)
+    gap_count = len(candidates) - len(detail_targets)
+    notes.append(f"Union: {len(candidates)} unique CVE candidates; {len(matches)} matched by summary; "
+                 f"{len(detail_targets)} full advisories checked; {detail_failures} detail requests failed")
+    if gap_count:
+        notes.append(f"{gap_count} additional candidates were not fully inspected; coverage incomplete")
+    if failures:
+        notes.append("Some Palo Alto PSIRT index queries failed; results may omit affected CVEs")
+    return {'rows': processed, 'ok': True, 'partial': bool(failures or detail_failures or gap_count), 'notes': notes}
 
 
 def forti_rss_items(xml):
